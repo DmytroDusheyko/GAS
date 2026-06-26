@@ -1,0 +1,310 @@
+/**
+ * ==============================================================================
+ * НАЗВА: Модуль автоматичної синхронізації банківських реєстрів (ПБ/ОТП)
+ * ОПИС: Забезпечує крос-документальну синхронізацію банківських транзакцій 
+ * із зовнішнього сховища "Банки_Реєстр" до операційного журналу руху грошових коштів.
+ * Працює за принципом Upsert (Додавання нових + Оновлення існуючих) за унікальним 
+ * банківським референсом (Transaction ID), запобігаючи дублюванню проводок.
+ * * КОМПОНЕНТ ЕКОСИСТЕМИ: Модуль Рівня 1 (Первинний імпорт банківських стрімів)
+ * ВЕРСІЯ: 1.6.5 (Повна стандартизація логіки ПБ-Грант та OTP)
+ * ДАТА ОНОВЛЕННЯ: 26.06.2026
+ * АВТОР: GitHub Financial Data Engineer
+ * ==============================================================================
+ */
+
+// ГЛОБАЛЬНІ КОНСТАНТИ ОТОЧЕННЯ
+/** @constant {string} ID файлу-джерела (Банки_Реєстр), куди стікаються виписки */
+const SOURCE_FILE_ID = "1pujDnWK_-tH8AV9ztn4PmOXwQYpv4Fpl7A4pRPWd9xU"; 
+/** @constant {string} ID цільового файлу розрахунків руху безготівкових коштів */
+const TARGET_FILE_ID = "1Uh2RclUGw6AQhHj-0UIs4LdHtqrOQAaOkQwqhxfotuI"; 
+
+/**
+ * Парсить текстовий рядок українського або стандартного формату дати у валідний об'єкт Date.
+ * Обробляє кейси двозначного написання року (РР -> РРРР) та обрізає часові хвости.
+ * @param {string} dateStr - Текстове представлення дати (напр., "25.06.26" або "25.06.2026 14:20")
+ * @return {Date|string} Об'єкт Date або порожній рядок у разі некоректних даних
+ */
+function parseStrictUkranianDate(dateStr) {
+  if (!dateStr) return "";
+  const trimmed = dateStr.toString().trim();
+  const parts = trimmed.split('.');
+  if (parts.length >= 3) {
+    const day = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10) - 1; 
+    let yearPart = parts[2].split(' ')[0].trim();
+    let year = parseInt(yearPart, 10);
+    if (!isNaN(year) && yearPart.length === 2) year = 2000 + year;
+    if (!isNaN(day) && !isNaN(month) && !isNaN(year)) return new Date(year, month, day);
+  }
+  return new Date(dateStr);
+}
+
+/**
+ * Динамічно збирає системний маркер фінансового каналу на основі мета-даних цільового аркуша.
+ * Конкатенує назву каси (A2) та бухгалтерський рахунок субконто (J2).
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} targetSheet - Цільовий аркуш
+ * @return {string} Скомпонований маркер каналу (напр., "ПриватБанк Поточний 311")
+ */
+function getChannelNameFromTarget(targetSheet) {
+  const channelTitle = targetSheet.getRange("A2").getValue().toString().trim();
+  let accountCode = targetSheet.getRange("J2").getValue().toString().replace(/[^\d]/g, "").trim();
+  if (!accountCode) {
+    accountCode = "111"; 
+  }
+  return channelTitle + " " + accountCode;
+}
+
+/**
+ * 1. СИНХРОНІЗАЦІЯ ПРИВАТБАНК (Поточний рахунок)
+ * Транслює стрім ПБ-2026 -> Ском ЗліПтахи Приват.
+ */
+function importPrivatBank() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const sourceSpreadsheet = SpreadsheetApp.openById(SOURCE_FILE_ID);
+    const targetSpreadsheet = SpreadsheetApp.openById(TARGET_FILE_ID);
+    
+    const sourceSheet = sourceSpreadsheet.getSheetByName("ПБ-2026");
+    const targetSheetName = "Ском ЗліПтахи Приват";
+    const targetSheet = targetSpreadsheet.getSheetByName(targetSheetName);
+    
+    if (!sourceSheet || !targetSheet) {
+      ui.alert("❌ Помилка: Не знайдено потрібні аркуші для ПриватБанку!");
+      return;
+    }
+    
+    const sourceLastRow = sourceSheet.getLastRow();
+    if (sourceLastRow < 6) {
+      ui.alert("⚠ Немає даних для перенесення на аркуші ПБ-2026.");
+      return;
+    }
+    
+    const channelName = getChannelNameFromTarget(targetSheet);
+    
+    const sourceData = sourceSheet.getRange(6, 1, sourceLastRow - 5, 11).getValues();
+    const sourceDisplayDates = sourceSheet.getRange(6, 2, sourceLastRow - 5, 1).getDisplayValues();
+    
+    // Індексація цільового аркуша через Хеш-Мапу для O(1) пошуку дублікатів
+    const targetLastRow = targetSheet.getLastRow();
+    const targetIdMap = new Map(); 
+    if (targetLastRow >= 9) {
+      const targetIds = targetSheet.getRange(9, 2, targetLastRow - 8, 1).getValues();
+      targetIds.forEach((row, idx) => {
+        if (row[0]) targetIdMap.set(row[0].toString().trim(), 9 + idx);
+      });
+    }
+    
+    let updatedCount = 0;
+    const rowsToInsert = [];
+    const localProcessedIds = new Set(); 
+    
+    sourceData.forEach((row, index) => {
+      const reference = row[10] ? row[10].toString().trim() : ""; 
+      if (!reference || localProcessedIds.has(reference)) return; 
+      localProcessedIds.add(reference);
+      
+      const rawDateStr = sourceDisplayDates[index][0];
+      let dateVal = parseStrictUkranianDate(rawDateStr);
+      const contraparty = row[7]; 
+      const purpose = row[5]; 
+      const amount = parseFloat(row[3]) || 0; 
+      
+      let inflow = amount > 0 ? amount : 0;
+      let outflow = amount < 0 ? Math.abs(amount) : 0;
+      
+      const rowData = [dateVal, reference, contraparty, purpose, inflow, outflow, "", "", "", "", channelName];
+      
+      // Логіка Upsert
+      if (targetIdMap.has(reference)) {
+        const targetRowNumber = targetIdMap.get(reference);
+        targetSheet.getRange(targetRowNumber, 1, 1, 11).setValues([rowData]);
+        updatedCount++;
+      } else {
+        rowsToInsert.push(rowData);
+      }
+    });
+    
+    // Пакетний ввід нових проводок в кінець журналу
+    if (rowsToInsert.length > 0) {
+      const startRow = targetSheet.getLastRow() < 9 ? 9 : targetSheet.getLastRow() + 1;
+      targetSheet.getRange(startRow, 1, rowsToInsert.length, 11).setValues(rowsToInsert);
+    }
+    
+    ui.alert(`✅ ПриватБанк оброблено:\n• Код каналу: ${channelName}\n• Оновлено записів: ${updatedCount}\n• Додано нових: ${rowsToInsert.length}`);
+  } catch (error) {
+    ui.alert("❌ Помилка ПриватБанку: " + error.toString());
+  }
+}
+
+/**
+ * 2. СИНХРОНІЗАЦІЯ ПРИВАТБАНК ГРАНТ (Грантовий рахунок)
+ * Транслює стрім ПБ-Грант-2026 -> Ском ГРАНТ. Логіка уніфікована із основним Приватом.
+ */
+function importPrivatGrantBank() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const sourceSpreadsheet = SpreadsheetApp.openById(SOURCE_FILE_ID);
+    const targetSpreadsheet = SpreadsheetApp.openById(TARGET_FILE_ID);
+    
+    const sourceSheet = sourceSpreadsheet.getSheetByName("ПБ-Грант-2026");
+    const targetSheetName = "Ском ГРАНТ";
+    const targetSheet = targetSpreadsheet.getSheetByName(targetSheetName);
+    
+    if (!sourceSheet || !targetSheet) {
+      ui.alert("❌ Помилка: Не знайдено аркуш джерела 'ПБ-Грант-2026' або цільовий '" + targetSheetName + "'!");
+      return;
+    }
+    
+    const sourceLastRow = sourceSheet.getLastRow();
+    if (sourceLastRow < 6) {
+      ui.alert("⚠ Немає даних для перенесення на аркуші ПБ-Грант-2026.");
+      return;
+    }
+    
+    const channelName = getChannelNameFromTarget(targetSheet);
+    
+    const sourceData = sourceSheet.getRange(6, 1, sourceLastRow - 5, 11).getValues();
+    const sourceDisplayDates = sourceSheet.getRange(6, 2, sourceLastRow - 5, 1).getDisplayValues();
+    
+    const targetLastRow = targetSheet.getLastRow();
+    const targetIdMap = new Map();
+    if (targetLastRow >= 9) {
+      const targetIds = targetSheet.getRange(9, 2, targetLastRow - 8, 1).getValues();
+      targetIds.forEach((row, idx) => {
+        if (row[0]) targetIdMap.set(row[0].toString().trim(), 9 + idx);
+      });
+    }
+    
+    let updatedCount = 0;
+    const rowsToInsert = [];
+    const localProcessedIds = new Set();
+    
+    sourceData.forEach((row, index) => {
+      const reference = row[10] ? row[10].toString().trim() : ""; 
+      if (!reference || localProcessedIds.has(reference)) return; 
+      localProcessedIds.add(reference);
+      
+      const rawDateStr = sourceDisplayDates[index][0];
+      let dateVal = parseStrictUkranianDate(rawDateStr);
+      const contraparty = row[7]; 
+      const purpose = row[5]; 
+      const amount = parseFloat(row[3]) || 0; 
+      
+      let inflow = amount > 0 ? amount : 0;
+      let outflow = amount < 0 ? Math.abs(amount) : 0;
+      
+      const rowData = [dateVal, reference, contraparty, purpose, inflow, outflow, "", "", "", "", channelName];
+      
+      if (targetIdMap.has(reference)) {
+        const targetRowNumber = targetIdMap.get(reference);
+        targetSheet.getRange(targetRowNumber, 1, 1, 11).setValues([rowData]);
+        updatedCount++;
+      } else {
+        rowsToInsert.push(rowData);
+      }
+    });
+    
+    if (rowsToInsert.length > 0) {
+      const startRow = targetSheet.getLastRow() < 9 ? 9 : targetSheet.getLastRow() + 1;
+      targetSheet.getRange(startRow, 1, rowsToInsert.length, 11).setValues(rowsToInsert);
+    }
+    
+    ui.alert(`✅ Приват Грант оброблено:\n• Код каналу: ${channelName}\n• Оновлено записів: ${updatedCount}\n• Додано нових: ${rowsToInsert.length}`);
+  } catch (error) {
+    ui.alert("❌ Помилка Гранту: " + error.toString());
+  }
+}
+
+/**
+ * 3. СИНХРОНІЗАЦІЯ OTP БАНК (Гривневий рахунок)
+ */
+function importOtpBank() {
+  importOtpGeneric("OTP-2026", "Ском ЗліПтахи ОТП");
+}
+
+/**
+ * 4. СИНХРОНІЗАЦІЯ OTP БАНК (Валютний рахунок)
+ */
+function importOtpValBank() {
+  importOtpGeneric("OTP-Вал-2026", "Ском ЗліПтахи ОТП$");
+}
+
+/**
+ * ГЕНЕРИЧНИЙ АЛГОРИТМ ДЛЯ OTP БАНКУ
+ * Абстрагує розбіжності між гривневими та валютними виписками, проводячи семантичний аналіз дебет/кредит.
+ * @param {string} sourceSheetName - Аркуш-джерело виписки
+ * @param {string} targetSheetName - Цільовий аркуш операційного журналу
+ */
+function importOtpGeneric(sourceSheetName, targetSheetName) {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const sourceSpreadsheet = SpreadsheetApp.openById(SOURCE_FILE_ID);
+    const targetSpreadsheet = SpreadsheetApp.openById(TARGET_FILE_ID);
+    
+    const sourceSheet = sourceSpreadsheet.getSheetByName(sourceSheetName);
+    const targetSheet = targetSpreadsheet.getSheetByName(targetSheetName);
+    
+    if (!sourceSheet || !targetSheet) return;
+    const sourceLastRow = sourceSheet.getLastRow();
+    if (sourceLastRow < 6) return;
+    
+    const channelName = getChannelNameFromTarget(targetSheet);
+    
+    const sourceData = sourceSheet.getRange(6, 1, sourceLastRow - 5, 12).getValues();
+    const sourceDisplayDates = sourceSheet.getRange(6, 10, sourceLastRow - 5, 1).getDisplayValues();
+    
+    const targetLastRow = targetSheet.getLastRow();
+    const targetIdMap = new Map();
+    if (targetLastRow >= 9) {
+      const targetIds = targetSheet.getRange(9, 2, targetLastRow - 8, 1).getValues();
+      targetIds.forEach((row, idx) => {
+        if (row[0]) targetIdMap.set(row[0].toString().trim(), 9 + idx);
+      });
+    }
+    
+    let updatedCount = 0;
+    const rowsToInsert = [];
+    const localProcessedIds = new Set();
+    
+    sourceData.forEach((row, index) => {
+      const docNum = row[10] ? row[10].toString().trim() : ""; 
+      if (!docNum || localProcessedIds.has(docNum)) return;
+      localProcessedIds.add(docNum);
+      
+      const rawDateStr = sourceDisplayDates[index][0];
+      let dateVal = parseStrictUkranianDate(rawDateStr);
+      
+      const type = row[2] ? row[2].toString().trim().toLowerCase() : ""; 
+      const contraparty = row[6]; 
+      const purpose = row[8]; 
+      const amount = parseFloat(row[11]) || 0; 
+      
+      // Семантичний розподіл Напрямку Грошей (Inflow/Outflow)
+      let inflow = 0; let outflow = 0;
+      if (type === "кредит" || type === "credit") inflow = amount;
+      else if (type === "дебет" || type === "debit") outflow = amount;
+      else { 
+        if (amount > 0) inflow = amount; else outflow = Math.abs(amount); 
+      }
+      
+      const rowData = [dateVal, docNum, contraparty, purpose, inflow, outflow, "", "", "", "", channelName];
+      
+      if (targetIdMap.has(docNum)) {
+        const targetRowNumber = targetIdMap.get(docNum);
+        targetSheet.getRange(targetRowNumber, 1, 1, 11).setValues([rowData]);
+        updatedCount++;
+      } else {
+        rowsToInsert.push(rowData);
+      }
+    });
+    
+    if (rowsToInsert.length > 0) {
+      const startRow = targetSheet.getLastRow() < 9 ? 9 : targetSheet.getLastRow() + 1;
+      targetSheet.getRange(startRow, 1, rowsToInsert.length, 11).setValues(rowsToInsert);
+    }
+    
+    ui.alert(`✅ ${targetSheetName} оброблено:\n• Код каналу: ${channelName}\n• Оновлено записів: ${updatedCount}\n• Додано нових: ${rowsToInsert.length}`);
+  } catch (error) {
+    ui.alert("❌ Помилка: " + error.toString());
+  }
+}
