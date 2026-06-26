@@ -1,0 +1,193 @@
+/**
+ * ==============================================================================
+ * НАЗВА: Скрипт консолідації залишків Рівня 3 та інтеграції з Хабом (cash)
+ * ОПИС: Агрегує фінансові залишки в розрізі напрямків (кас) із розірваних 
+ * зовнішніх операційних файлів. Використовує Developer Metadata (системні теги 
+ * аркушів) для ідентифікації джерел. Виводить детальну аналітику на локальний 
+ * аркуш та транслює сумарні місячні вектори в головний хаб під тег "cash".
+ * * КОМПОНЕНТ ЕКОСИСТЕМИ: Модуль Рівня 3 (Консолідація розподілених сховищ)
+ * ВЕРСІЯ: 3.1.0-HubIntegration (Оптимізовано для GitHub)
+ * ДАТА ОНОВЛЕННЯ: 26.06.2026
+ * АВТОР: GitHub Financial Systems Architect
+ * ==============================================================================
+ */
+
+// ГЛОБАЛЬНІ КОНСТАНТИ СЕРЕДОВИЩА
+/** @constant {string} ID зовнішнього файлу, що містить реєстр посилань на каси */
+const EXTERNAL_CONFIG_FILE_ID = "1VKqhpg6MI9ggB0_aHA2v0kaZsc0lzn2_mrxG2IUNJYo"; 
+/** @constant {string} Ім'я аркуша конфігурації у зовнішньому файлі */
+const CONFIG_SHEET_NAME_BAL = "⚙️ Налаштування";
+/** @constant {string} Локальний аркуш для розгортання детальної аналітики */
+const BALANCES_SHEET_NAME_BAL = "Зведені Залишки";
+/** @constant {string} Головний аркуш-хаб управлінського балансу */
+const HUB_SHEET_NAME = "Залишки"; 
+/** @constant {string} Системний ключ метаданих для ідентифікації фінансових аркушів */
+const METADATA_KEY_BAL = "SYSTEM_SHEET_TAG";
+
+/**
+ * Головна функція консолідації.
+ * Сканує підключені файли, збирає балансові зрізи за допомогою Metadata API, 
+ * зіставляє часові вектори за алгоритмом Smart-Mapping і оновлює хаб.
+ * * @external SpreadsheetApp
+ * @return {void}
+ */
+function consolidateL3Balances() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const startTime = new Date().getTime();
+  
+  // 1. ВАЛІДАЦІЯ ПЕРВИННИХ ЛОКАЛЬНИХ АРКУШІВ
+  const balSheet = ss.getSheetByName(BALANCES_SHEET_NAME_BAL);
+  if (!balSheet) {
+    ui.alert(`❌ Помилка: У цьому файлі не знайдено аркуш "${BALANCES_SHEET_NAME_BAL}".`);
+    return;
+  }
+
+  // 2. ЗЧИТУВАННЯ РЕЄСТРУ ЗОВНІШНІХ ФАЙЛІВ (КОНФІГУРАЦІЯ)
+  let configSheet;
+  try {
+    const externalSpreadsheet = SpreadsheetApp.openById(EXTERNAL_CONFIG_FILE_ID);
+    configSheet = externalSpreadsheet.getSheetByName(CONFIG_SHEET_NAME_BAL);
+  } catch (err) {
+    ui.alert(`❌ Помилка доступу до зовнішнього файлу налаштувань: ${err.toString()}`);
+    return;
+  }
+
+  const lastConfigRow = configSheet.getLastRow();
+  const configValues = configSheet.getRange(4, 2, lastConfigRow - 3, 2).getValues();
+  let uniqueFileIds = [];
+  configValues.forEach(row => {
+    const fId = row[1] ? row[1].toString().trim() : "";
+    if (fId.length > 0) uniqueFileIds.push(fId);
+  });
+  
+  // Видалення дублікатів ID файлів (дедуплікація черги)
+  uniqueFileIds = [...new Set(uniqueFileIds)];
+  
+  // 3. БЕЗПЕЧНЕ ОЧИЩЕННЯ ТІЛЬКИ МАТРИЦІ ДАНИХ (Рядки 4+)
+  const lastBalRow = balSheet.getLastRow();
+  if (lastBalRow >= 4) {
+    balSheet.getRange(4, 1, lastBalRow - 3, 1).clearContent(); 
+    balSheet.getRange(4, 3, lastBalRow - 3, 13).clearContent(); 
+  }
+  
+  let balanceMap = {}; 
+  
+  // 4. ДИНАМІЧНИЙ СКАНЕР ЗОВНІШНІХ КАС ТА ЗБІР МЕТАДАНИХ
+  for (const fileId of uniqueFileIds) {
+    try {
+      const sourceSpreadsheet = SpreadsheetApp.openById(fileId);
+      const sheets = sourceSpreadsheet.getSheets();
+      
+      balancesLoop:
+      for (const sheet of sheets) {
+        const lastRow = sheet.getLastRow();
+        if (lastRow < 4) continue;
+        
+        // Пошук розробницьких метаданих для захисту від перейменування аркушів користувачами
+        const metaList = sheet.getDeveloperMetadata();
+        for (const meta of metaList) {
+          if (meta.getKey() === METADATA_KEY_BAL && meta.getValue().toString().trim().toUpperCase().endsWith("_BALANCES")) {
+            
+            const balData = sheet.getRange(4, 1, lastRow - 3, 14).getValues();
+            
+            balData.forEach(bRow => {
+              if (!bRow[0]) return;
+              const channelName = bRow[0].toString().trim();
+              
+              // Ігнорування технічних та підсумкових рядків
+              if (channelName === "" || ["УСЬОГО", "ИТОГО", "РАЗОМ", "ВСЬОГО"].includes(channelName.toUpperCase())) return;
+              
+              balanceMap[channelName] = Array(13).fill(0);
+              
+              // Конвертація текстових фінансових прочерків у валідні Float-типи
+              for (let col = 1; col <= 13; col++) {
+                const valStr = bRow[col] ? bRow[col].toString().trim() : "";
+                balanceMap[channelName][col - 1] = (valStr === "-" || valStr === "") ? 0 : (parseFloat(bRow[col]) || 0);
+              }
+            });
+            break balancesLoop; 
+          }
+        }
+      }
+    } catch (e) { 
+      Logger.log("Помилка обробки файлу " + fileId + ": " + e.toString()); 
+    }
+  }
+  
+  // Вектор для накопичення сумарних місячних залишків (13 періодів)
+  const aggregatedMonthlySums = Array(13).fill(0);
+  
+  const finalChannels = Object.keys(balanceMap);
+  if (finalChannels.length > 0) {
+    finalChannels.sort((a, b) => a.localeCompare(b[0])); 
+    
+    const namesRows = [];
+    const financeRows = [];
+    
+    finalChannels.forEach(channelName => {
+      namesRows.push([channelName]);    
+      financeRows.push(balanceMap[channelName]); 
+      
+      // Паралельна агрегація місячних векторів для хабу
+      for (let m = 0; m < 13; m++) {
+        aggregatedMonthlySums[m] += balanceMap[channelName][m];
+      }
+    });
+    
+    // Запис деталізованої аналітичної матриці
+    balSheet.getRange(4, 1, namesRows.length, 1).setValues(namesRows);
+    const targetFinanceRange = balSheet.getRange(4, 3, financeRows.length, 13);
+    targetFinanceRange.setValues(financeRows);
+    targetFinanceRange.setNumberFormat('#,##0.00;-#,##0.00;"-"');
+  }
+  
+  // Запис Timestamp оновлення локальної аналітики
+  balSheet.getRange("I1").setValue(new Date()).setNumberFormat('dd.mm.yyyy HH:mm:ss');
+  
+  // 5. SMART-MAPPING АЛГОРИТМ: СИНХРОНІЗАЦІЯ З ГОЛОВНИМ ХАБОМ УПРАВЛІНСЬКОГО БАЛАНСУ
+  const hubSheet = ss.getSheetByName(HUB_SHEET_NAME);
+  if (hubSheet) {
+    const hubLastRow = hubSheet.getLastRow();
+    const hubLastCol = hubSheet.getLastColumn();
+    
+    const hubDates = hubSheet.getRange(2, 3, 1, hubLastCol >= 3 ? hubLastCol - 2 : 1).getValues()[0];
+    const currentDates = balSheet.getRange(2, 3, 1, 13).getValues()[0];
+    
+    // Динамічний пошук індексу цільового рядка за системним тегом "cash"
+    const hubTags = hubSheet.getRange(1, 2, hubLastRow, 1).getValues();
+    let cashRowIndex = -1;
+    for (let r = 0; r < hubTags.length; r++) {
+      if (hubTags[r][0].toString().trim() === "cash") {
+        cashRowIndex = r + 1;
+        break;
+      }
+    }
+    
+    if (cashRowIndex !== -1) {
+      // Розумний мапінг: суми вносяться тільки у разі повного збігу часових міток (Date-to-Date)
+      currentDates.forEach((cDate, cIdx) => {
+        if (cDate instanceof Date) {
+          hubDates.forEach((hDate, hIdx) => {
+            if (hDate instanceof Date && 
+                cDate.getDate() === hDate.getDate() &&
+                cDate.getMonth() === hDate.getMonth() &&
+                cDate.getFullYear() === hDate.getFullYear()) {
+              
+              const targetCell = hubSheet.getRange(cashRowIndex, hIdx + 3);
+              targetCell.setValue(aggregatedMonthlySums[cIdx]);
+              targetCell.setNumberFormat('#,##0.00;-#,##0.00;"-"');
+            }
+          });
+        }
+      });
+    } else {
+      Logger.log(`⚠️ Попередження: Тег "cash" не знайдено у стовпці B аркуша "${HUB_SHEET_NAME}".`);
+    }
+  } else {
+    Logger.log(`⚠️ Попередження: Аркуш хабу "${HUB_SHEET_NAME}" не знайдено.`);
+  }
+  
+  const endTime = new Date().getTime();
+  ui.alert(`✅ Зведені Залишки успішно прораховані за ${((endTime - startTime) / 1000).toFixed(1)} сек.\n💰 Аналітику рознесено, а загальний підсумок записано на аркуш "${HUB_SHEET_NAME}" під тег cash.`);
+}
