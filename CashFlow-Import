@@ -1,0 +1,86 @@
+/**
+ * ==============================================================================
+ * НАЗВА: Модуль безпечного імпорту реєстру Cash Flow
+ * ОПИС: Автоматично імпортує фінансові транзакції (Грошовий потік) та контрольні
+ * суми залишків із зовнішнього файлу-джерела. Скрипт спроєктований як
+ * "безпечний" (Safe-Write): він делікатно затирає лише змінні дані, не 
+ * пошкоджуючи архітектуру цільового аркуша (формули, стилі, фільтри у рядках 1-8).
+ * * КОМПОНЕНТ ЕКОСИСТЕМИ: Модуль Рівня 1 (Базовий первинний імпорт даних)
+ * * ВЕРСІЯ: 1.1.0 (Адаптація під інтеграцію з GitHub)
+ * ДАТА ОНОВЛЕННЯ: 26.06.2026
+ * АВТОР: GitHub-колаборатор
+ * ==============================================================================
+ */
+
+/**
+ * Виконує безпечний імпорт реєстру грошового потоку.
+ * Зчитує матрицю даних A9:L та комірки E2, F2 з віддаленої таблиці і транслює в хаб.
+ * * @external SpreadsheetApp
+ * @throws {Error} Якщо відсутні права доступу до файлів або порушено структуру аркушів.
+ * @return {void}
+ */
+function importCashFlowData() {
+  const ui = SpreadsheetApp.getUi();
+  
+  // Конфігурація середовища (ID файлу-джерела та імена аркушів)
+  const SOURCE_SPREADSHEET_ID = '1VKqhpg6MI9ggB0_aHA2v0kaZsc0lzn2_mrxG2IUNJYo';
+  const SOURCE_SHEET_NAME = 'Зведений Потік';
+  const TARGET_SHEET_NAME = 'Зведений Потік Імпорт';
+  
+  try {
+    // 1. ПІДКЛЮЧЕННЯ ДО ЗОВНІШНЬОГО ФАЙЛУ-ДЖЕРЕЛА
+    const sourceSpreadsheet = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+    const sourceSheet = sourceSpreadsheet.getSheetByName(SOURCE_SHEET_NAME);
+    
+    if (!sourceSheet) {
+      ui.alert('Помилка', 'Не знайдено аркуш "' + SOURCE_SHEET_NAME + '" у файлі-джерелі!', ui.ButtonSet.OK);
+      return;
+    }
+    
+    // Валідація наявності записів у джерелі
+    const lastRowSource = sourceSheet.getLastRow();
+    if (lastRowSource < 9) {
+      ui.alert('Увага', 'На аркуші джерела немає транзакцій для копіювання (порожньо з 9 рядка).', ui.ButtonSet.OK);
+      return;
+    }
+    
+    // Екстракція даних: основна матриця транзакцій (A9:L) та контрольні суми (E2, F2)
+    const sourceValues = sourceSheet.getRange(9, 1, lastRowSource - 8, 12).getValues();
+    const sourceE2 = sourceSheet.getRange('E2').getValue();
+    const sourceF2 = sourceSheet.getRange('F2').getValue();
+    
+    // 2. ПІДКЛЮЧЕННЯ ДО ПОТОЧНОЇ ТАБЛИЦІ (ХАБУ)
+    const currentSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    let targetSheet = currentSpreadsheet.getSheetByName(TARGET_SHEET_NAME);
+    
+    if (!targetSheet) {
+      ui.alert('Помилка', 'Не знайдено цільовий аркуш "' + TARGET_SHEET_NAME + '" у поточній таблиці!', ui.ButtonSet.OK);
+      return;
+    }
+    
+    // 3. ДЕЛІКАТНЕ ОЧИЩЕННЯ ТІЛЬКИ ДАНИХ ТРАНЗАКЦІЙ (Рядки 9+)
+    const lastRowTarget = targetSheet.getLastRow();
+    if (lastRowTarget >= 9) {
+      // Очищаємо вміст від 9 рядка по 12 колонку (L), зберігаючи оформлення фільтрів та формули шапки (рядки 1-8)
+      targetSheet.getRange(9, 1, lastRowTarget - 8, 12).clearContent();
+    }
+    
+    // 4. ЗАПИС НОВИХ ЗНАЧЕНЬ ТА ТРАНСЛЯЦІЯ ЗАЛИШКІВ
+    targetSheet.getRange(9, 1, sourceValues.length, 12).setValues(sourceValues);
+    targetSheet.getRange('E2').setValue(sourceE2);
+    targetSheet.getRange('F2').setValue(sourceF2);
+    
+    // 5. ФІКСАЦІЯ ЧАСУ УСПІШНОЇ СИНХРОНІЗАЦІЇ В КОМІРКУ H2
+    const now = new Date();
+    const pad = function(n) { return n < 10 ? '0' + n : n; };
+    const timeString = pad(now.getDate()) + '.' + pad(now.getMonth() + 1) + '.' + now.getFullYear() + ' ' + 
+                       pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+    
+    targetSheet.getRange('H2').setValue(timeString);
+    
+    ui.alert('Успіх', 'Реєстр грошового потоку успішно імпортовано! Дані оновлено.', ui.ButtonSet.OK);
+    
+  } catch (e) {
+    ui.alert('Помилка імпорту потоку', 'Деталі: ' + e.message, ui.ButtonSet.OK);
+  }
+}
