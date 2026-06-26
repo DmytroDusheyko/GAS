@@ -1,0 +1,351 @@
+/**
+ * @fileoverview Автоматизована система генерації горизонтального багатоканального звіту Cash Flow
+ * із динамічним сортуванням каналів за цифровим кодом та лінійним згортанням повернень згідно з Довідником.
+ * @version 1.4.1
+ * @date 2026-06-19 13:35:00
+ */
+
+/**
+ * Керує процесом побудови багатоканального горизонтального звіту.
+ * @param {Object} params Параметри фільтрації (startDate, endDate).
+ * @return {string} Статус виконання ("OK" або текст помилки).
+ */
+function processMultiChannelReportGeneration(params) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    
+    const sheetImport = ss.getSheetByName('Зведений Потік Імпорт');
+    const sheetDoc = ss.getSheetByName('Довідник');
+    const sheetReport = ss.getSheetByName('ЗвітРухГрКоштівКанали');
+    const sheetBalances = ss.getSheetByName('Залишки Імпорт');
+    const sheetCalc = ss.getSheetByName('Залишки Розрах');
+    
+    if (!sheetImport || !sheetDoc || !sheetReport || !sheetCalc) {
+      return 'ПОМИЛКА: Перевірте назви аркушів. Мають бути: "Зведений Потік Імпорт", "Довідник", "ЗвітРухГрКоштівКанали", "Залишки Розрах"';
+    }
+    
+    const startDate = new Date(params.startDate + 'T00:00:00');
+    const endDate = new Date(params.endDate + 'T23:59:59');
+    
+    const startRow = 5;
+    const startCol = 1;
+
+    // --- 1. ОЧИЩЕННЯ ТА ПІДГОТОВКА АРКУША ---
+    const maxRows = sheetReport.getMaxRows();
+    const lastRowReport = sheetReport.getLastRow();
+    if (maxRows > startRow) sheetReport.showRows(startRow, maxRows - (startRow - 1));
+
+    if (lastRowReport >= startRow) {
+      sheetReport.getRange(startRow, startCol, Math.max(lastRowReport - startRow + 1, 100), sheetReport.getMaxColumns()).clear();
+      for (let i = 0; i < 4; i++) {
+        try { sheetReport.getRange(startRow, startCol, sheetReport.getMaxRows() - startRow + 1, 1).shiftRowGroupDepth(-1); } catch (e) { break; }
+      }
+    }
+    
+    const maxCols = sheetReport.getMaxColumns();
+    if (maxCols >= 1) {
+      sheetReport.getRange(4, 1, 1, maxCols).clearFormat().clearContent();
+    }
+
+    // --- 2. ЗАПОВНЕННЯ БАЗОВОЇ ШАПКИ ЗВІТУ ---
+    const pad = function(n) { return n < 10 ? '0' + n : n; };
+    const formatShortDate = function(d) { return pad(d.getDate()) + '.' + pad(d.getMonth() + 1) + '.' + d.getFullYear().toString().slice(-2); };
+    
+    sheetReport.getRange('A2').setValue('Багатоканальний звіт (Всі канали)').setFontWeight('bold');
+    sheetReport.getRange('A3').setValue('За період: ' + formatShortDate(startDate) + ' - ' + formatShortDate(endDate));
+    
+    const now = new Date();
+    const timeString = pad(now.getDate()) + '.' + pad(now.getMonth() + 1) + '.' + now.getFullYear() + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+    sheetReport.getRange('B2').setValue('Звіт сформовано:').setFontWeight('bold');
+    sheetReport.getRange('B3').setValue(timeString).setFontWeight('normal').setHorizontalAlignment('left');
+
+    sheetCalc.getRange('I1').setValue(timeString);
+
+    // --- 3. ЗЧИТУВАННЯ ДОВІДНИКА СТАТЕЙ ---
+    const lastRowDoc = sheetDoc.getLastRow();
+    const classifier = {};
+    if (lastRowDoc >= 4) {
+      const docData = sheetDoc.getRange(4, 1, lastRowDoc - 3, 3).getValues();
+      docData.forEach(row => {
+        const code = row[0] ? row[0].toString().trim() : '';
+        const type = row[1] ? row[1].toString().trim() : '';      
+        const activity = row[2] ? row[2].toString().trim() : '';  
+        if (code) {
+          if (!classifier[code]) classifier[code] = [];
+          classifier[code].push({ type: type, activity: activity });
+        }
+      });
+    }
+
+    // --- 4. ІНІЦІАЛІЗАЦІЯ СТРУКТУРИ КАНАЛІВ ---
+    const channelSummary = {}; 
+    if (sheetBalances && sheetBalances.getLastRow() >= 4) {
+      const balancesMatrix = sheetBalances.getRange(4, 1, sheetBalances.getLastRow() - 3, 2).getValues();
+      balancesMatrix.forEach(row => {
+        const chanName = row[0] ? row[0].toString().trim() : '';
+        const chanBal2026 = Number(row[1]) || 0;
+        if (chanName) {
+          channelSummary[chanName] = { base2026: chanBal2026, histMove: 0, periodIn: 0, periodOut: 0 };
+        }
+      });
+    }
+
+    // --- 5. АНАЛІЗ РЕЄСТРУ ТРАНЗАКЦІЙ З УРАХУВАННЯМ ПРАВИЛ ЗГОРТАННЯ ---
+    const lastSourceRow = sheetImport.getLastRow();
+    if (lastSourceRow < 7) return 'ПОМИЛКА: Немає даних в реєстрі імпорту';
+    
+    const importData = sheetImport.getRange(7, 1, lastSourceRow - 6, 12).getValues();
+    const matrixSummary = {}; 
+    const dateOf2026 = new Date('2026-01-01T00:00:00');
+
+    importData.forEach(row => {
+      if (!row[0]) return;
+      const pDate = new Date(row[0]);
+      if (isNaN(pDate.getTime())) return;
+      
+      const rowChannel = row[10] ? row[10].toString().trim() : (row[2] ? row[2].toString().trim() : '');
+      if (!rowChannel) return;
+
+      if (!channelSummary[rowChannel]) {
+        channelSummary[rowChannel] = { base2026: 0, histMove: 0, periodIn: 0, periodOut: 0 };
+      }
+
+      const rawIncoming = Number(row[4]) || 0;
+      const rawOutgoing = Number(row[5]) || 0;
+      if (rawIncoming === 0 && rawOutgoing === 0) return;
+
+      if (pDate >= dateOf2026 && pDate < startDate) {
+        channelSummary[rowChannel].histMove += (rawIncoming - rawOutgoing);
+      }
+      if (pDate >= startDate && pDate <= endDate) {
+        channelSummary[rowChannel].periodIn += rawIncoming;
+        channelSummary[rowChannel].periodOut += rawOutgoing;
+      }
+
+      if (pDate >= startDate && pDate <= endDate) {
+        let code = row[6] ? row[6].toString().trim() : '';
+        if (!code) code = 'НЕРОЗПОДІЛЕНО (ПРОПУЩЕНО КОД СТАТТІ)';
+
+        const rules = classifier[code] || [];
+        let targetType = '';
+        let targetActivity = '';
+        let finalAmount = 0;
+
+        if (rules.length === 0) {
+          targetType = rawIncoming > 0 ? 'Надходження' : 'Виплати';
+          targetActivity = 'Операційна';
+          finalAmount = rawIncoming > 0 ? rawIncoming : rawOutgoing;
+        } 
+        else if (rules.length === 1) {
+          const rule = rules[0];
+          targetType = rule.type; 
+          targetActivity = rule.activity;
+
+          if (targetType === 'Виплати') {
+            finalAmount = rawOutgoing - rawIncoming; 
+          } else {
+            finalAmount = rawIncoming - rawOutgoing; 
+          }
+        } 
+        else {
+          const isIncomingTx = rawIncoming > 0;
+          const currentDirection = isIncomingTx ? 'Надходження' : 'Виплати';
+          
+          const matchedRule = rules.find(r => r.type === currentDirection) || rules[0];
+          targetType = matchedRule.type;
+          targetActivity = matchedRule.activity;
+          finalAmount = isIncomingTx ? rawIncoming : rawOutgoing;
+        }
+
+        if (finalAmount === 0) return;
+
+        const key = code + '_||_' + targetType;
+        if (!matrixSummary[key]) {
+          matrixSummary[key] = { code: code, type: targetType, activity: targetActivity, channels: {} };
+        }
+        if (!matrixSummary[key].channels[rowChannel]) {
+          matrixSummary[key].channels[rowChannel] = 0;
+        }
+        matrixSummary[key].channels[rowChannel] += finalAmount;
+      }
+    });
+
+    // --- СОРТУВАННЯ КАНАЛІВ ЗА ЧИСЛОВИМ КОДОМ ---
+    const getChannelNumber = function(name) {
+      const match = name.match(/\d+/);
+      return match ? parseInt(match[0], 10) : 9999;
+    };
+
+    const orderedChannels = Object.keys(channelSummary).sort((a, b) => {
+      return getChannelNumber(a) - getChannelNumber(b);
+    });
+
+    const totalColsToOutput = 2 + orderedChannels.length;
+    const headerRange = sheetReport.getRange(4, 1, 1, totalColsToOutput);
+    
+    sheetReport.getRange(4, 1).setValue('Показники');
+    sheetReport.getRange(4, 2).setValue('Усього (Підсумок)');
+    orderedChannels.forEach((chanName, idx) => {
+      sheetReport.getRange(4, 3 + idx).setValue(chanName);
+    });
+
+    headerRange
+      .setBackground('#434343')
+      .setFontColor('#ffffff')
+      .setFontWeight('bold')
+      .setFontSize(10)
+      .setWrap(true)
+      .setHorizontalAlignment('center')
+      .setVerticalAlignment('middle');
+      
+    sheetReport.setRowHeight(4, 42);
+
+    // Оновлення розрахованих залишків
+    const calcRowsOutput = [];
+    orderedChannels.forEach(chanName => {
+      const data = channelSummary[chanName];
+      const dynamicStartBal = data.base2026 + data.histMove; 
+      const dynamicEndBal = dynamicStartBal + data.periodIn - data.periodOut;
+      calcRowsOutput.push([chanName, dynamicStartBal, data.periodIn, data.periodOut, dynamicEndBal]);
+    });
+    const lastRowCalc = sheetCalc.getLastRow();
+    if (lastRowCalc >= 4) sheetCalc.getRange(4, 1, Math.max(lastRowCalc - 3, 1), 5).clearContent();
+    if (calcRowsOutput.length > 0) sheetCalc.getRange(4, 1, calcRowsOutput.length, 5).setValues(calcRowsOutput);
+
+    // --- 6. ПОБУДОВА МАТРИЦІ РЯДКІВ ЗВІТУ ---
+    let rowsData = [], rowFormats = [];
+    const activities = [
+      { name: 'Операційна', label: '1. Рух коштів у результаті операційної діяльності', netLabel: 'Чистий рух коштів від операційної діяльності' },
+      { name: 'Інвестиційна', label: '2. Рух коштів у результаті інвестиційної діяльності', netLabel: 'Чистий рух коштів від інвестиційної діяльності' },
+      { name: 'Фінансова', label: '3. Рух коштів у результаті фінансової діяльності', netLabel: 'Чистий рух коштів від фінансової діяльності' },
+      { name: 'Внутрішні переміщення', label: 'Внутрішні переміщення', netLabel: 'Чистий рух за внутрішніми переміщеннями' }
+    ];
+
+    function getSortedKeysForActivity(activityName, targetType) {
+      const matched = [];
+      Object.keys(matrixSummary).forEach(key => {
+        const item = matrixSummary[key];
+        if (item.type !== targetType) return;
+        if (item.activity.toLowerCase().indexOf(activityName.toLowerCase()) === -1 && activityName.toLowerCase().indexOf(item.activity.toLowerCase()) === -1) return;
+        
+        let totalVal = 0;
+        Object.keys(item.channels).forEach(c => { totalVal += item.channels[c]; });
+        if (totalVal !== 0) {
+          matched.push({ key: key, code: item.code, total: totalVal });
+        }
+      });
+      return matched.sort((a, b) => b.total - a.total);
+    }
+
+    const finalStartRow = [];
+    const finalNetRow = [];
+    const finalEndRow = [];
+    let totalAllStart = 0, totalAllEnd = 0;
+
+    orderedChannels.forEach(chanName => {
+      const startBal = channelSummary[chanName].base2026 + channelSummary[chanName].histMove;
+      const endBal = startBal + channelSummary[chanName].periodIn - channelSummary[chanName].periodOut;
+      finalStartRow.push(startBal);
+      finalEndRow.push(endBal);
+      finalNetRow.push(endBal - startBal);
+      totalAllStart += startBal;
+      totalAllEnd += endBal;
+    });
+
+    activities.forEach(act => {
+      let mainRow = [act.label, 0];
+      orderedChannels.forEach(() => mainRow.push(0));
+      rowsData.push(mainRow); rowFormats.push('LVL1_MAIN');
+      
+      // НАДХОДЖЕННЯ
+      let subIncRow = [act.name === 'Внутрішні переміщення' ? 'Внутрішні переміщення: надходження' : act.name + 'ні надходження', 0];
+      orderedChannels.forEach(() => subIncRow.push(0));
+      const incKeys = getSortedKeysForActivity(act.name, 'Надходження');
+      const incDetailsRows = [];
+
+      incKeys.forEach(item => {
+        let detRow = [item.code, 0];
+        let totalDet = 0;
+        orderedChannels.forEach(chanName => {
+          const val = matrixSummary[item.key].channels[chanName] || 0;
+          detRow.push(val);
+          totalDet += val;
+        });
+        detRow[1] = totalDet;
+        subIncRow[1] += totalDet;
+        for (let i = 2; i < detRow.length; i++) subIncRow[i] += detRow[i];
+        incDetailsRows.push(detRow);
+      });
+      rowsData.push(subIncRow); rowFormats.push('LVL2_SUB');
+      incDetailsRows.forEach(r => { rowsData.push(r); rowFormats.push('LVL3_DETAIL'); });
+
+      // ВИПЛАТИ
+      let subOutRow = [act.name === 'Внутрішні переміщення' ? 'Внутрішні переміщення: виплати' : act.name + 'ні виплати', 0];
+      orderedChannels.forEach(() => subOutRow.push(0));
+      const outKeys = getSortedKeysForActivity(act.name, 'Виплати');
+      const outDetailsRows = [];
+
+      outKeys.forEach(item => {
+        let detRow = [item.code, 0];
+        let totalDet = 0;
+        orderedChannels.forEach(chanName => {
+          const val = matrixSummary[item.key].channels[chanName] || 0;
+          detRow.push(-val); 
+          totalDet += val;
+        });
+        detRow[1] = -totalDet;
+        subOutRow[1] += -totalDet;
+        for (let i = 2; i < detRow.length; i++) subOutRow[i] += detRow[i]; 
+        outDetailsRows.push(detRow);
+      });
+      rowsData.push(subOutRow); rowFormats.push('LVL2_SUB');
+      outDetailsRows.forEach(r => { rowsData.push(r); rowFormats.push('LVL3_DETAIL'); });
+
+      // ЧИСТИЙ РЕЗУЛЬТАТ СЕКЦІЇ
+      let totalNetRowAct = [act.netLabel, 0];
+      for (let i = 2; i < subIncRow.length; i++) {
+        const netVal = subIncRow[i] + subOutRow[i]; 
+        totalNetRowAct.push(netVal);
+        totalNetRowAct[1] += netVal;
+      }
+      rowsData.push(totalNetRowAct); rowFormats.push('LVL1_TOTAL');
+      
+      let emptyRow = ['', '']; orderedChannels.forEach(() => emptyRow.push(''));
+      rowsData.push(emptyRow); rowFormats.push('EMPTY');
+    });
+
+    rowsData.push(['Залишок грошових коштів на початок періоду', totalAllStart].concat(finalStartRow)); rowFormats.push('FINAL_SUMMARY');
+    rowsData.push(['Чистий грошовий потік за період', totalAllEnd - totalAllStart].concat(finalNetRow)); rowFormats.push('FINAL_SUMMARY');
+    rowsData.push(['Залишок грошових коштів на кінець періоду', totalAllEnd].concat(finalEndRow)); rowFormats.push('FINAL_SUMMARY');
+
+    // --- 7. ЗАПИС ТА СТИЛІЗАЦІЯ ---
+    const targetRange = sheetReport.getRange(startRow, startCol, rowsData.length, totalColsToOutput);
+    targetRange.setValues(rowsData);
+    targetRange.setNumberFormat('#,##0.00;(#,##0.00);"-"');
+
+    rowFormats.forEach((formatType, index) => {
+      const rIdx = startRow + index;
+      const fullRowRange = sheetReport.getRange(rIdx, 1, 1, totalColsToOutput);
+      
+      if (formatType === 'LVL1_MAIN') {
+        fullRowRange.setBackground('#c9daf8').setFontWeight('bold');
+        sheetReport.getRange(rIdx, 2, 1, totalColsToOutput - 1).setValue(''); 
+      } else if (formatType === 'LVL1_TOTAL') {
+        fullRowRange.setBackground('#a4c2f4').setFontWeight('bold');
+      } else if (formatType === 'LVL2_SUB') {
+        fullRowRange.setBackground('#edf2fa').setFontWeight('bold');
+        sheetReport.getRange(rIdx, 1).setValue('    ' + sheetReport.getRange(rIdx, 1).getValue());
+        try { sheetReport.getRange(rIdx, 1).shiftRowGroupDepth(1); } catch(e){}
+      } else if (formatType === 'LVL3_DETAIL') {
+        fullRowRange.setFontSize(9).setFontColor('#444444');
+        sheetReport.getRange(rIdx, 1).setValue('        ' + sheetReport.getRange(rIdx, 1).getValue());
+        try { sheetReport.getRange(rIdx, 1).shiftRowGroupDepth(1).shiftRowGroupDepth(1); } catch(e){}
+      } else if (formatType === 'FINAL_SUMMARY') {
+        fullRowRange.setBackground('#cfe2f3').setFontWeight('bold');
+      }
+    });
+
+    sheetReport.autoResizeColumns(1, totalColsToOutput);
+    return 'OK';
+  } catch (e) { return 'ПОМИЛКА СКРИПТА: ' + e.message; }
+}
