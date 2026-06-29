@@ -1,0 +1,250 @@
+/**
+ * СКРИПТ: Імпорт грошового потоку з ZNK та SO та фільтрація за датами / кодами
+ * * Опис: Містить функції для імпорту фінансових даних із зовнішнього файлу грошового потоку.
+ * Усі алгоритми використовують динамічний мапінг стовпців на основі текстових міток (тегів).
+ * * Склад функцій скрипту:
+ * 1) importPaymentsData() — імпорт платежів із фільтрацією за діапазоном дат (зчитуються з C3, D3) 
+ * на цільовий аркуш "Присвоєння-ZNK". Автоматично оновлює таймстамп у клітинці G1.
+ * * 2) importZnkSoPaymentsData() — послідовний імпорт даних із двох аркушів джерела ("2025" та "Зведений Потік") 
+ * на цільовий аркуш "Платежі-ZNK-SO-Імпорт". Динамічно зіставляє мітки джерела (A5:L5) та цілі (A5:J5), 
+ * фільтрує рядки за наявністю "ZNK" або "SO" у стовпці "Odoo_ZNK_Code", об'єднує масиви, сортує їх 
+ * хронологічно від А до Я за датою та оновлює окремий таймстамп у клітинці G2.
+ * * Версія: 5.0.0
+ * Час зміни: 21.06.2026 09:40
+ * Автор: Система
+ */
+
+/**
+ * Функція імпорту платежів із фільтрацією за діапазоном (C3, D3) та сортуванням
+ * Цільовий аркуш: "Присвоєння-ZNK"
+ */
+function importPaymentsData() {
+  const ui = SpreadsheetApp.getUi();
+  
+  const SOURCE_SPREADSHEET_ID = "1VKqhpg6MI9ggB0_aHA2v0kaZsc0lzn2_mrxG2IUNJYo";
+  const SOURCE_SHEET_NAME = "Зведений Потік";
+  const TARGET_SHEET_NAME = "Присвоєння-ZNK";
+  
+  try {
+    const targetSs = SpreadsheetApp.getActiveSpreadsheet();
+    const targetSheet = targetSs.getSheetByName(TARGET_SHEET_NAME);
+    if (!targetSheet) {
+      throw new Error(`Цільовий аркуш "${TARGET_SHEET_NAME}" не знайдено у цьому файлі.`);
+    }
+    
+    // --- ЗЧИТУВАННЯ ПАРАМЕТРІВ ФІЛЬТРАЦІЇ (C3, D3) ---
+    const filterStart = targetSheet.getRange("C3").getValue();
+    const filterEnd = targetSheet.getRange("D3").getValue();
+    
+    const startTime = filterStart instanceof Date ? filterStart.getTime() : new Date(filterStart).getTime();
+    const endTime = filterEnd instanceof Date ? filterEnd.getTime() : new Date(filterEnd).getTime();
+    
+    const hasValidFilter = !isNaN(startTime) && !isNaN(endTime);
+    // ----------------------------------------------------
+    
+    // Зчитування міток із діапазону A6:J6 для автоматичного мапінгу стовпців
+    const targetHeaders = targetSheet.getRange("A6:J6").getValues()[0].map(h => String(h).trim());
+    const dateTargetIndex = targetHeaders.indexOf("Date_of_payment");
+    
+    const sourceSs = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+    const sourceSheet = sourceSs.getSheetByName(SOURCE_SHEET_NAME);
+    if (!sourceSheet) {
+      throw new Error(`Джерельний аркуш "${SOURCE_SHEET_NAME}" не знайдено у файлі грошового потоку.`);
+    }
+    
+    const sourceLastRow = sourceSheet.getLastRow();
+    if (sourceLastRow < 9) {
+      ui.alert("Сповіщення", "У джерельному файлі відсутні дані для імпорту (діапазон A9:L порожній).", ui.ButtonSet.OK);
+      return;
+    }
+    
+    const sourceData = sourceSheet.getRange(9, 1, sourceLastRow - 8, 12).getValues();
+    
+    // Існуючий стабільний мапінг для першої функції
+    const sourceColumnMapping = {
+      "Date_of_payment": 0, "Payment_ID": 1, "Counterparty_Channel": 2,
+      "Payment_Description": 3, "Cash_Receipt": 4, "Cash_Disbursement": 5,
+      "Account_Code": 6, "Custodian": 7, "Odoo_ZNK_Code": 8,
+      "Internal_Note": 9, "Channel_Name_Code": 10, "Net_Cash_Flow": 11
+    };
+    
+    const outputRows = [];
+    for (let i = 0; i < sourceData.length; i++) {
+      const sourceRow = sourceData[i];
+      if (!sourceRow[0] && !sourceRow[1] && !sourceRow[3]) continue;
+      
+      if (hasValidFilter) {
+        const rowDateRaw = sourceRow[0];
+        const rowDateTime = rowDateRaw instanceof Date ? rowDateRaw.getTime() : new Date(rowDateRaw).getTime();
+        if (isNaN(rowDateTime) || rowDateTime < startTime || rowDateTime > endTime) {
+          continue;
+        }
+      }
+      
+      const newRow = [];
+      for (let j = 0; j < targetHeaders.length; j++) {
+        const header = targetHeaders[j];
+        const sourceIndex = sourceColumnMapping[header];
+        if (sourceIndex !== undefined) {
+          newRow.push(sourceRow[sourceIndex]);
+        } else {
+          newRow.push("");
+        }
+      }
+      outputRows.push(newRow);
+    }
+    
+    if (dateTargetIndex !== -1 && outputRows.length > 0) {
+      outputRows.sort(function(rowA, rowB) {
+        const valA = rowA[dateTargetIndex];
+        const valB = rowB[dateTargetIndex];
+        const dateA = valA instanceof Date ? valA : new Date(valA);
+        const dateB = valB instanceof Date ? valB : new Date(valB);
+        return (dateA instanceof Date ? dateA.getTime() : 0) - (dateB instanceof Date ? dateB.getTime() : 0);
+      });
+    }
+    
+    const targetLastRow = targetSheet.getLastRow();
+    if (targetLastRow >= 10) {
+      targetSheet.getRange(10, 1, targetLastRow - 9, 10).clearContent();
+    }
+    
+    if (outputRows.length > 0) {
+      targetSheet.getRange(10, 1, outputRows.length, 10).setValues(outputRows);
+    }
+    
+    const globalSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Присвоєння-ZNK");
+    if (globalSheet) {
+      globalSheet.getRange('G1').setValue(new Date()).setNumberFormat("dd.mm.yy HH:mm");
+    }
+    
+    ui.alert("Успіх", `Дані успішно відфільтровано за діапазоном C3:D3, відсортовано та імпортовано.\nПеренесено рядків: ${outputRows.length}.`, ui.ButtonSet.OK);
+    
+  } catch (error) {
+    ui.alert("Помилка імпорту", error.toString(), ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * Функція імпорту платежів ZNK та SO з двох аркушів джерела ("2025" та "Зведений Потік")
+ * Динамічно зчитує мітки з джерела (A5:L5) та цілі (A5:J5). Фільтрація за Odoo_ZNK_Code.
+ * Цільовий аркуш: "Платежі-ZNK-SO-Імпорт"
+ */
+function importZnkSoPaymentsData() {
+  const ui = SpreadsheetApp.getUi();
+  
+  const SOURCE_SPREADSHEET_ID = "1VKqhpg6MI9ggB0_aHA2v0kaZsc0lzn2_mrxG2IUNJYo";
+  const SOURCE_SHEETS = ["2025", "Зведений Потік"]; 
+  const TARGET_SHEET_NAME = "Платежі-ZNK-SO-Імпорт";
+  
+  try {
+    const targetSs = SpreadsheetApp.getActiveSpreadsheet();
+    const targetSheet = targetSs.getSheetByName(TARGET_SHEET_NAME);
+    if (!targetSheet) {
+      throw new Error(`Цільовий аркуш "${TARGET_SHEET_NAME}" не знайдено у цьому файлі.`);
+    }
+    
+    // 1. Зчитуємо цільові мітки з діапазону A5:J5
+    const targetHeaders = targetSheet.getRange("A5:J5").getValues()[0].map(h => String(h).trim());
+    const dateTargetIndex = targetHeaders.indexOf("Date_of_payment");
+    
+    const sourceSs = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+    const outputRows = [];
+    
+    // 2. Послідовний обхід аркушів-джерел
+    for (let s = 0; s < SOURCE_SHEETS.length; s++) {
+      const sheetName = SOURCE_SHEETS[s];
+      const sourceSheet = sourceSs.getSheetByName(sheetName);
+      
+      if (!sourceSheet) continue; 
+      
+      const sourceLastRow = sourceSheet.getLastRow();
+      if (sourceLastRow < 9) continue; 
+      
+      // Зчитуємо динамічні мітки поточного аркуша (A5:L5)
+      const sourceHeaders = sourceSheet.getRange("A5:L5").getValues()[0].map(h => String(h).trim());
+      
+      // Будуємо словник стовпців для поточного аркуша
+      const sourceColumnMapping = {};
+      for (let idx = 0; idx < sourceHeaders.length; idx++) {
+        if (sourceHeaders[idx]) {
+          sourceColumnMapping[sourceHeaders[idx]] = idx;
+        }
+      }
+      
+      const odooCodeSourceIndex = sourceColumnMapping["Odoo_ZNK_Code"];
+      if (odooCodeSourceIndex === undefined) {
+        throw new Error(`На аркуші "${sheetName}" в рядку 5 не знайдено обов'язкову мітку 'Odoo_ZNK_Code'.`);
+      }
+      
+      // Витягуємо масив даних (починаючи з 9 рядка)
+      const sourceData = sourceSheet.getRange(9, 1, sourceLastRow - 8, 12).getValues();
+      
+      for (let i = 0; i < sourceData.length; i++) {
+        const sourceRow = sourceData[i];
+        if (!sourceRow[0] && !sourceRow[1] && !sourceRow[3]) continue;
+        
+        const rawOdooCode = sourceRow[odooCodeSourceIndex];
+        const odooCode = String(rawOdooCode || "").trim(); 
+        
+        // Фільтрація за кодами “ZNK” або “SO” (регістронезалежна)
+        if (odooCode.toUpperCase().indexOf("ZNK") === -1 && odooCode.toUpperCase().indexOf("SO") === -1) {
+          continue;
+        }
+        
+        // Формуємо новий рядок на основі міток цілі
+        const newRow = [];
+        for (let j = 0; j < targetHeaders.length; j++) {
+          const header = targetHeaders[j];
+          const sourceIndex = sourceColumnMapping[header];
+          
+          if (sourceIndex !== undefined) {
+            newRow.push(sourceRow[sourceIndex]);
+          } else {
+            newRow.push("");
+          }
+        }
+        outputRows.push(newRow);
+      }
+    }
+    
+    // 3. Хронологічне сортування об'єднаного масиву за датою (від А до Я)
+    if (dateTargetIndex !== -1 && outputRows.length > 0) {
+      outputRows.sort(function(rowA, rowB) {
+        const valA = rowA[dateTargetIndex];
+        const valB = rowB[dateTargetIndex];
+        const dateA = valA instanceof Date ? valA : new Date(valA);
+        const dateB = valB instanceof Date ? valB : new Date(valB);
+        const timeA = isNaN(dateA.getTime()) ? 0 : dateA.getTime();
+        const timeB = isNaN(dateB.getTime()) ? 0 : dateB.getTime();
+        return timeA - timeB;
+      });
+    }
+    
+    // 4. Очищення цільового діапазону від 9 рядка і нижче (A9:J)
+    const targetLastRow = targetSheet.getLastRow();
+    if (targetLastRow >= 9) {
+      targetSheet.getRange(9, 1, targetLastRow - 8, 10).clearContent();
+    }
+    
+    // 5. Запис об'єднаних даних
+    if (outputRows.length > 0) {
+      targetSheet.getRange(9, 1, outputRows.length, 10).setValues(outputRows);
+    }
+    
+    // Оновлення таймстампу в G2
+    updateZnkSoTimestamp(targetSheet);
+    
+    ui.alert("Успіх", `Дані з аркушів "2025" та "Зведений Потік" успішно об'єднано та відсортовано.\nВсього перенесено рядків: ${outputRows.length}.`, ui.ButtonSet.OK);
+    
+  } catch (error) {
+    ui.alert("Помилка імпорту", error.toString(), ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * Допоміжна функція оновлення таймстампу в клітинці G2
+ */
+function updateZnkSoTimestamp(sheet) {
+  sheet.getRange('G2').setValue(new Date()).setNumberFormat("dd.mm.yy HH:mm");
+}
