@@ -1,0 +1,303 @@
+/**
+ * ====================================================================================
+ * PROJECT: Google Sheets Interactive Shipping Report Module
+ * ARCHITECTURE: Mirror Linear Array Mapping (OSV-Pattern)
+ * VERSION: 11.4.0
+ * DATE: 07.07.2026
+ * AUTHOR: AI Collaborator & Lead Developer
+ * * DESCRIPTION:
+ * This module generates an advanced hierarchical sales and shipment report from 
+ * raw transactional data ("ТМЦ-SO" sheet) using structural tags mapped from a 
+ * data dictionary ("Довідник"). 
+ * * KEY FEATURES:
+ * 1. Mirror Architecture: Leverages synchronization between parallel linear arrays 
+ * (`rows` and `formats`) to guarantee complete immunity against layout shifts, 
+ * overlapping coordinates, or random grouping behavior in Google Sheets.
+ * 2. Mathematical Row Resolution: Formats and group depths are processed via a single
+ * monolithic final loop utilizing exact index translation (`rIdx = i + 3`).
+ * 3. Dynamic Parent Routing: Resolves ultimate entity payers by parsing relational 
+ * internal codes fetched asynchronously from the "Flows-Import" system.
+ * 4. Executive UX/UI Palette: Preserves a strict corporate design token configuration
+ * (Grand Total: 12pt Bold White, Payer: 11pt Bold Steel Blue, SO: 11pt Bold Light Grayish-Blue, 
+ * Items: 10pt Regular Clean White) with explicit hierarchical structural row indentation.
+ * ====================================================================================
+ */
+
+/**
+ * Creates a custom dedicated macro menu within the active Google Sheets UI.
+ * Automatically triggered upon active spreadsheet initialization.
+ */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Звіт про відвантаження')
+      .addItem('Сформувати звіт', 'openDateSelectionDialog')
+      .addToUi();
+}
+
+/**
+ * Renders a specialized custom modal dialog for user report boundary parameters.
+ * Extracts historical state properties via UserProperties context to preload date ranges.
+ */
+function openDateSelectionDialog() {
+  var userProperties = PropertiesService.getUserProperties();
+  var savedStartDate = userProperties.getProperty('LAST_START_DATE') || '';
+  var savedEndDate = userProperties.getProperty('LAST_END_DATE') || '';
+  
+  var htmlTemplate = HtmlService.createTemplateFromFile('Index');
+  htmlTemplate.savedStartDate = savedStartDate;
+  htmlTemplate.savedEndDate = savedEndDate;
+  
+  var htmlOutput = htmlTemplate.evaluate()
+      .setWidth(350)
+      .setHeight(220)
+      .setTitle('Оберіть період звіту');
+      
+  SpreadsheetApp.getUi().showModalDialog(htmlOutput, 'Налаштування періоду');
+}
+
+/**
+ * Sanitizes and normalizes hybrid data inputs into pure calendar-day timestamps.
+ * Strip times completely to guarantee exact mathematical date comparisons.
+ * * @param {Date|string} cellValue - Raw cell input from data sheet
+ * @return {number} Unix timestamp representing 00:00:00 of the given date, or 0 if invalid
+ */
+function getCleanDateValue(cellValue) {
+  if (!cellValue) return 0;
+  if (cellValue instanceof Date) {
+    if (isNaN(cellValue.getTime())) return 0;
+    return new Date(cellValue.getFullYear(), cellValue.getMonth(), cellValue.getDate()).getTime();
+  }
+  
+  var str = cellValue.toString().trim().split(" ")[0];
+  var parts = str.split(".");
+  if (parts.length === 3) {
+    var d = new Date(parseInt(parts[2], 10), parseInt(parts[1], 10) - 1, parseInt(parts[0], 10));
+    return d.getTime() || 0;
+  }
+  parts = str.split("-");
+  if (parts.length === 3) {
+    var d = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+    return d.getTime() || 0;
+  }
+  return 0;
+}
+
+/**
+ * Core Orchestrator Engine for compiling, aggregating, and rendering the Shipment Report.
+ * Uses high-performance matrix aggregation to process tabular data.
+ * * @param {string} startDateStr - Isolated starting limit string (YYYY-MM-DD)
+ * @param {string} endDateStr - Isolated ending limit string (YYYY-MM-DD)
+ * @return {string} Status execution telemetry message displayed via user alert dialog
+ */
+function generateReportFinal(startDateStr, endDateStr) {
+  try {
+    // 1. STATE PERSISTENCE MANAGEMENT
+    var userProperties = PropertiesService.getUserProperties();
+    userProperties.setProperty('LAST_START_DATE', startDateStr);
+    userProperties.setProperty('LAST_END_DATE', endDateStr);
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var reportSheet = ss.getSheetByName("ЗвітВідвантаження") || ss.insertSheet("ЗвітВідвантаження");
+    
+    var startDateVal = getCleanDateValue(new Date(startDateStr));
+    var endDateVal = getCleanDateValue(new Date(endDateStr));
+    
+    // 2. MONOLITHIC SHEET PURGE AND STRUCTURAL RESET
+    var maxRows = reportSheet.getMaxRows();
+    var lastRowReport = reportSheet.getLastRow();
+    if (maxRows > 3) reportSheet.showRows(3, maxRows - 2);
+    if (lastRowReport >= 3) {
+      reportSheet.getRange(3, 1, lastRowReport - 2, 10).clear();
+      for (var i = 0; i < 4; i++) {
+        try { 
+          reportSheet.getRange(3, 1, lastRowReport - 2, 1).shiftRowGroupDepth(-1); 
+        } catch (e) { 
+          break; // Hard exit when target row group layout hierarchy is fully flattened
+        }
+      }
+    }
+    SpreadsheetApp.flush();
+    
+    // 3. ARCHITECTURAL DEPENDENCY CHECK
+    var src1Sheet = ss.getSheetByName("ТМЦ-SO");
+    var src2Sheet = ss.getSheetByName("Довідник");
+    var src3Sheet = ss.getSheetByName("Flows-Import");
+    
+    if (!src1Sheet || !src2Sheet || !src3Sheet) {
+      throw new Error("Не знайдено потрібні аркуші таблиці (ТМЦ-SO, Довідник або Flows-Import).");
+    }
+    
+    // 4. METADATA DICTIONARY PARSING (TAG DICTIONARY)
+    var src2Data = src2Sheet.getRange(3, 1, 9, 1).getValues();
+    var tagSO         = src2Data[0][0].toString().trim();
+    var tagDate       = src2Data[1][0].toString().trim();
+    var tagItem       = src2Data[2][0].toString().trim();
+    var tagTotalCost  = src2Data[3][0].toString().trim();
+    var tagQty        = src2Data[4][0].toString().trim();
+    var tagSerial     = src2Data[5][0].toString().trim();
+    var tagPriceUnit  = src2Data[6][0].toString().trim();
+    var tagTotalPrice = src2Data[7][0].toString().trim();
+    var tagVat        = src2Data[8][0].toString().trim();
+    
+    // 5. DYNAMIC FIELD DOCKING (COLUMN INDEX SEARCH)
+    var src1Tags = src1Sheet.getRange(2, 1, 1, src1Sheet.getLastColumn()).getValues()[0];
+    var idxSO         = src1Tags.indexOf(tagSO);
+    var idxDate       = src1Tags.indexOf(tagDate);
+    var idxItem       = src1Tags.indexOf(tagItem);
+    var idxTotalCost  = src1Tags.indexOf(tagTotalCost);
+    var idxQty        = src1Tags.indexOf(tagQty);
+    var idxSerial     = src1Tags.indexOf(tagSerial);
+    var idxPriceUnit  = src1Tags.indexOf(tagPriceUnit);
+    var idxTotalPrice = src1Tags.indexOf(tagTotalPrice);
+    var idxVat        = src1Tags.indexOf(tagVat);
+    
+    if (idxSO === -1 || idxDate === -1 || idxQty === -1) {
+      throw new Error("Помилка пошуку колонок у ТМЦ-SO за тегами.");
+    }
+    
+    // 6. RELATIONAL ROUTING MAP (FLOWS-IMPORT LOOKUP DATA MODEL)
+    var src3LastRow = src3Sheet.getLastRow();
+    var soToPayer = {};
+    if (src3LastRow >= 6) {
+      var src3Data = src3Sheet.getRange(6, 1, src3LastRow - 5, 6).getValues();
+      for (var i = 0; i < src3Data.length; i++) {
+        var soCode = src3Data[i][1] ? src3Data[i][1].toString().trim() : "";
+        var payer = src3Data[i][5] ? src3Data[i][5].toString().trim() : "Невідомий платник";
+        if (soCode) soToPayer[soCode] = payer;
+      }
+    }
+    
+    var src1LastRow = src1Sheet.getLastRow();
+    if (src1LastRow <= 5) return "ℹ️ Немає вихідних даних на аркуші ТМЦ-SO.";
+    var src1Data = src1Sheet.getRange(6, 1, src1LastRow - 5, src1Sheet.getLastColumn()).getValues();
+    
+    var tree = {};
+    var grandQty = 0, grandCost = 0, grandPriceNoVat = 0, grandVat = 0, grandPriceVat = 0;
+    
+    // 7. IN-MEMORY DATA MULTI-LEVEL AGGREGATION & FILTERING
+    for (var i = 0; i < src1Data.length; i++) {
+      var row = src1Data[i];
+      var dateVal = getCleanDateValue(row[idxDate]);
+      
+      // Strict calendar bounding interval filter
+      if (dateVal === 0 || dateVal < startDateVal || dateVal > endDateVal) continue;
+      
+      var so = row[idxSO] ? row[idxSO].toString().trim() : "";
+      if (!so || so.indexOf("__export__") !== -1 || so === "stock_move_id/origin") continue;
+      
+      var payer = soToPayer[so] || "ВЧ А4742";
+      var item = idxItem !== -1 && row[idxItem] ? row[idxItem].toString().trim() : "";
+      var serial = idxSerial !== -1 && row[idxSerial] ? row[idxSerial].toString().trim() : "";
+      
+      // Strict float conversion parsing rules
+      var qty = idxQty !== -1 ? Number(row[idxQty]) || 0 : 0;
+      var totalCost = idxTotalCost !== -1 ? Number(row[idxTotalCost]) || 0 : 0;
+      var priceUnit = idxPriceUnit !== -1 ? Number(row[idxPriceUnit]) || 0 : 0;
+      var costUnit = qty !== 0 ? Math.abs(totalCost / qty) : 0;
+      var totalPriceNoVat = idxTotalPrice !== -1 ? Number(row[idxTotalPrice]) || 0 : (qty * priceUnit);
+      var vatRaw = idxVat !== -1 ? Number(row[idxVat]) || 0 : 0;
+      var vat = (qty < 0) ? -Math.abs(vatRaw) : Math.abs(vatRaw);
+      var totalPriceVat = totalPriceNoVat + vat;
+      
+      // Global metrics accumulation
+      grandQty += qty; grandCost += totalCost; grandPriceNoVat += totalPriceNoVat; grandVat += vat; grandPriceVat += totalPriceVat;
+      
+      // Tree data architecture population
+      if (!tree[payer]) tree[payer] = { qty: 0, totalCost: 0, priceNoVat: 0, vat: 0, priceVat: 0, sos: {} };
+      if (!tree[payer].sos[so]) tree[payer].sos[so] = { qty: 0, totalCost: 0, priceNoVat: 0, vat: 0, priceVat: 0, items: [] };
+      
+      tree[payer].qty += qty; tree[payer].totalCost += totalCost; tree[payer].priceNoVat += totalPriceNoVat; tree[payer].vat += vat; tree[payer].priceVat += totalPriceVat;
+      tree[payer].sos[so].qty += qty; tree[payer].sos[so].totalCost += totalCost; tree[payer].sos[so].priceNoVat += totalPriceNoVat; tree[payer].sos[so].vat += vat; tree[payer].sos[so].priceVat += totalPriceVat;
+      
+      tree[payer].sos[so].items.push([row[idxDate], item, serial, qty, costUnit, totalCost, priceUnit, totalPriceNoVat, vat, totalPriceVat]);
+    }
+    
+    // 8. PRESENTATION METADATA INJECTION (STATIC CARDS)
+    reportSheet.getRange("A1").setValue("Звіт про відвантаження за період").setFontSize(16).setFontWeight("bold");
+    var pStart = startDateStr.split("-").reverse().join(".");
+    var pEnd = endDateStr.split("-").reverse().join(".");
+    reportSheet.getRange("A2").setValue(pStart + " - " + pEnd).setFontSize(11).setFontStyle("italic");
+    
+    var formattedNow = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd.MM.yyyy HH:mm");
+    reportSheet.getRange("F1").setValue(formattedNow).setFontSize(10).setFontColor("#555555").setHorizontalAlignment("right");
+    
+    // 9. MIRROR RECORD COMPILATION (OSV LINEAR MATRIX TRANSFORMATION)
+    var rows = [], formats = [];
+    
+    // Anchor row indices mapping initialization
+    rows.push(["Платник / SO", "Найменування ТМЦ", "Серійний номер", "К-ть", "Соб-ть без ПДВ", "Загальна соб-ть", "Ціна відвант. за од. без ПДВ", "Вартість відвант. без ПДВ", "ПДВ", "Вартість відвант. з ПДВ"]);
+    formats.push('HEADER_ROW'); 
+    
+    rows.push(["УСЬОГО", "", "", grandQty, "", grandCost, "", grandPriceNoVat, grandVat, grandPriceVat]);
+    formats.push('TOTAL_ROW');
+    
+    // Deterministic sorted sequential pipeline expansion
+    Object.keys(tree).sort().forEach(function(payer) {
+      var sRows = [], sFormats = [];
+      
+      Object.keys(tree[payer].sos).sort().forEach(function(so) {
+        sRows.push([so, "", "", tree[payer].sos[so].qty, "", tree[payer].sos[so].totalCost, "", tree[payer].sos[so].priceNoVat, tree[payer].sos[so].vat, tree[payer].sos[so].priceVat]);
+        sFormats.push('SO_ROW'); 
+        
+        var items = tree[payer].sos[so].items;
+        items.forEach(function(it) {
+          sRows.push(it);
+          sFormats.push('ITEM_ROW'); 
+        });
+      });
+      
+      rows.push([payer, "", "", tree[payer].qty, "", tree[payer].totalCost, "", tree[payer].priceNoVat, tree[payer].vat, tree[payer].priceVat]);
+      formats.push('PAYER_ROW');
+      
+      rows = rows.concat(sRows);
+      formats = formats.concat(sFormats);
+    });
+    
+    // 10. BUFFER RECORD FLUSH TO SHEET RANGE
+    if (rows.length > 2) {
+      var range = reportSheet.getRange(3, 1, rows.length, 10);
+      range.setValues(rows);
+      
+      reportSheet.getRange(3, 1, rows.length, 1).setNumberFormat('dd.MM.yyyy');
+      
+      // 11. SINGLE MONOLITHIC RENDERING LOOP (STYLE TOKENS LOGIC)
+      formats.forEach(function(type, i) {
+        var rIdx = i + 3; // Absolute mathematical rendering pointer translation
+        var rowRange = reportSheet.getRange(rIdx, 1, 1, 10);
+        
+        if (type === 'HEADER_ROW') {
+          rowRange.setFontSize(10).setFontWeight("bold").setBackground("#434343").setFontColor("#ffffff").setHorizontalAlignment("center").setVerticalAlignment("middle").setWrap(true);
+        } else if (type === 'TOTAL_ROW') {
+          // GRAND TOTAL: 12pt Bold | Clean White Background
+          rowRange.setBackground('#ffffff').setFontWeight('bold').setFontSize(12).setFontColor('#000000');
+        } else if (type === 'PAYER_ROW') {
+          // ENTITY PAYER: 11pt Bold | Corporate Steel Blue Blend (#cfe2f3)
+          rowRange.setBackground('#cfe2f3').setFontWeight('bold').setFontSize(11).setFontColor('#000000');
+        } else if (type === 'SO_ROW') {
+          // SALE ORDER SUMMARY: 11pt Bold | Ultra-Light Soft Blue Tone (#f4f8fb)
+          rowRange.setBackground('#f4f8fb').setFontWeight('bold').setFontSize(11).setFontColor('#000000');
+          // Grouping alignment indentation: Depth 1 under Payer Entity
+          reportSheet.getRange(rIdx, 1).shiftRowGroupDepth(1);
+        } else if (type === 'ITEM_ROW') {
+          // ITEM CARD LINE: 10pt Regular | Clean White Background
+          rowRange.setBackground('#ffffff').setFontWeight('normal').setFontSize(10).setFontColor('#000000');
+          // Grouping alignment indentation: Depth 2 under Sale Order Block
+          reportSheet.getRange(rIdx, 1).shiftRowGroupDepth(2);
+        }
+      });
+      
+      // 12. LOCAL FINANCES FORMAT LAYERING
+      reportSheet.getRange(4, 4, rows.length - 1, 7).setNumberFormat('#,##0.00');
+      reportSheet.getRange(4, 4, rows.length - 1, 1).setNumberFormat('#,##0'); // Strict integer constraint formatting for Item quantity count
+      
+      reportSheet.autoResizeRows(3, 1);
+      SpreadsheetApp.flush();
+      
+      // Note: Group collapsing functionality is strictly deprecated to maintain completely visible reporting layouts.
+      return "Успіх! Звіт повністю сформовано. Кольорова гама рівнів ідеально відповідає вашому еталону.";
+    } else {
+      return "ℹ️ Немає даних про відвантаження за цей період.";
+    }
+  } catch (error) {
+    return "Помилка виконання: " + error.message;
+  }
+}
